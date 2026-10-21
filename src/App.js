@@ -36,27 +36,37 @@ const DUPLICATE_RADIUS_M = 250;
 /* API + data helpers                                                */
 /* ---------------------------------------------------------------- */
 async function api(path, options = {}) {
-  const { body, ...rest } = options;
+  const { body, headers: extraHeaders, ...rest } = options;
   let res;
+
   try {
     res = await fetch(API_BASE + path, {
       ...rest,
-      // Only send a Content-Type when there is a body (keeps GETs simple requests).
-      headers: body ? { "Content-Type": "application/json" } : undefined,
+      headers: {
+        ...(body ? { "Content-Type": "application/json" } : {}),
+        ...(extraHeaders || {}),
+      },
       body,
     });
   } catch {
-    throw new Error("Can't reach the CIVIX server. Is it running at " + API_BASE + "?");
+    throw new Error(
+      "Can't reach the CIVIX server. Is it running at " + API_BASE + "?"
+    );
   }
+
   let json = null;
   try {
     json = await res.json();
   } catch {
-    /* response had no JSON body */
+    // The response may have no JSON body.
   }
+
   if (!res.ok) {
-    throw new Error((json && json.error) || `Request failed (${res.status}).`);
+    throw new Error(
+      (json && json.error) || `Request failed (${res.status}).`
+    );
   }
+
   return json;
 }
 
@@ -292,15 +302,23 @@ export default function App() {
     window.scrollTo({ top: 0, behavior: "instant" });
   };
 
-  const handleAuthed = (user) => {
-    setCurrentUser(user);
-    try {
-      localStorage.setItem("civix_user", JSON.stringify(user));
-    } catch {
-      /* storage unavailable — stay signed in for this session only */
-    }
-    goTo("user")();
-  };
+  
+const handleAuthed = (result) => {
+  const user = result.user;
+  const token = result.token;
+
+  setCurrentUser(user);
+
+  try {
+    localStorage.setItem("civix_user", JSON.stringify(user));
+    localStorage.setItem("civix_token", token);
+  } catch {
+    /* Storage unavailable — session-only fallback */
+  }
+
+  goTo("user")();
+};
+
 
   return (
     <>
@@ -374,17 +392,18 @@ export default function App() {
         status={status}
         currentUser={currentUser}
       />
-      <ReportIssue
-        active={screen === "report"}
-        goTo={goTo}
-        model={model}
-        status={status}
-        activeCategory={activeCategory}
-        setActiveCategory={setActiveCategory}
-      />
-    </>
-  );
-}
+      
+<ReportIssue
+  active={screen === "report"}
+  goTo={goTo}
+  model={model}
+  status={status}
+  activeCategory={activeCategory}
+  setActiveCategory={setActiveCategory}
+  currentUser={currentUser}
+  refresh={loadData}
+/>
+
 
 /* ============================================================ */
 /* LANDING PAGE                                                  */
@@ -699,7 +718,7 @@ function Login({ active, authMode, setAuthMode, onAuthed }) {
             body: JSON.stringify({ identifier: id, password }),
           });
       setPassword("");
-      onAuthed(result.user);
+      onAuthed(result.user, result.token);
     } catch (err) {
       setError(err.message);
     } finally {
@@ -1161,10 +1180,22 @@ function UserDashboard({ active, goTo, model, status, currentUser }) {
 /* ============================================================ */
 /* REPORT A NEW ISSUE                                             */
 /* ============================================================ */
-function ReportIssue({ active, goTo, model, status, activeCategory, setActiveCategory }) {
+function ReportIssue({
+  active,
+  goTo,
+  model,
+  status,
+  activeCategory,
+  setActiveCategory,
+  currentUser,
+  refresh,
+}) {
   const [description, setDescription] = useState("");
   const [location, setLocation] = useState(null); // { lat, lng } once the browser shares it
   const [locMessage, setLocMessage] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+const [submitError, setSubmitError] = useState("");
+const [submitSuccess, setSubmitSuccess] = useState("");
 
   const slug = activeCategory || (model.categories[0] && model.categories[0].slug);
 
@@ -1183,6 +1214,65 @@ function ReportIssue({ active, goTo, model, status, activeCategory, setActiveCat
       { enableHighAccuracy: true, timeout: 10000 }
     );
   };
+const handleSubmit = async () => {
+  if (submitting) return;
+
+  setSubmitError("");
+  setSubmitSuccess("");
+
+  if (!currentUser) {
+    setSubmitError("Please sign in before submitting a report.");
+    return;
+  }
+
+  const token = localStorage.getItem("civix_user_token");
+
+  if (!token) {
+    setSubmitError("Please sign in again before submitting a report.");
+    return;
+  }
+
+  if (!description.trim()) {
+    setSubmitError("Please describe the issue before submitting.");
+    return;
+  }
+
+  if (!slug || !model.categories.some((c) => c.slug === slug)) {
+    setSubmitError("Please choose a valid issue category.");
+    return;
+  }
+
+  setSubmitting(true);
+
+  try {
+    const result = await api("/issues/report", {
+      method: "POST",
+      headers: {
+        "x-user-token": token,
+      },
+      body: JSON.stringify({
+        category_slug: slug,
+        description: description.trim(),
+        latitude: location ? location.lat : null,
+        longitude: location ? location.lng : null,
+      }),
+    });
+
+    setDescription("");
+    setLocation(null);
+    setLocMessage("");
+
+    setSubmitSuccess(
+      `Report submitted successfully! Your reference number is ${result.public_code}.`
+    );
+
+    await refresh();
+  } catch (err) {
+    setSubmitError(err.message);
+  } finally {
+    setSubmitting(false);
+  }
+};
 
   // Duplicate detection: open reports in the same category close to the reporter.
   const similar = location
@@ -1268,9 +1358,27 @@ function ReportIssue({ active, goTo, model, status, activeCategory, setActiveCat
                 📷 Tap to add a photo (optional but helps triage)
               </div>
 
-              <button className="btn btn-primary btn-block" style={{ marginTop: 22 }}>
-                Submit report
-              </button>
+              {submitError && (
+  <div className="form-error" role="alert">
+    {submitError}
+  </div>
+)}
+
+{submitSuccess && (
+  <div className="api-notice" role="status" style={{ marginTop: 12 }}>
+    {submitSuccess}
+  </div>
+)}
+
+<button
+  type="button"
+  className="btn btn-primary btn-block"
+  style={{ marginTop: 22 }}
+  onClick={handleSubmit}
+  disabled={submitting}
+>
+  {submitting ? "Submitting report…" : "Submit report"}
+</button>
             </div>
           </div>
         </div>

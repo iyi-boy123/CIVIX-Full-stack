@@ -135,6 +135,31 @@ async function safeCompare(password, hash) {
 const ttlHours = Number(ADMIN_TOKEN_TTL_HOURS);
 const TOKEN_TTL_MS = (Number.isFinite(ttlHours) && ttlHours > 0 ? ttlHours : 8) * 3600 * 1000;
 const adminTokens = new Map(); // token -> expiry time (ms). Cleared when the server restarts.
+const userTokens = new Map();
+
+function createUserToken(userId) {
+  const token = crypto.randomBytes(32).toString("hex");
+  userTokens.set(token, {
+    userId,
+    expiresAt: Date.now() + TOKEN_TTL_MS,
+  });
+  return token;
+}
+
+function requireUser(req, res, next) {
+  const token = req.get("x-user-token");
+  const session = token && userTokens.get(token);
+
+  if (!session || session.expiresAt <= Date.now()) {
+    if (token) userTokens.delete(token);
+    return res.status(401).json({
+      error: "Please sign in again before submitting a report.",
+    });
+  }
+
+  req.userId = session.userId;
+  next();
+}
 
 setInterval(() => {
   const now = Date.now();
@@ -220,8 +245,15 @@ app.post("/api/register", ah(async (req, res) => {
     }
     throw err;
   }
-  const [rows] = await pool.query("SELECT * FROM users WHERE id = ?", [result.insertId]);
-  res.status(201).json({ user: publicUser(rows[0]) });
+  const [rows] = await pool.query(
+  "SELECT * FROM users WHERE id = ?",
+  [result.insertId]
+);
+
+const user = publicUser(rows[0]);
+const token = createUserToken(user.id);
+
+res.status(201).json({ user, token });
 }));
 
 app.post("/api/login", ah(async (req, res) => {
@@ -250,9 +282,12 @@ app.post("/api/login", ah(async (req, res) => {
     return res.status(401).json({ error: "Invalid email/phone or password." });
   }
   userLoginLimiter.clear(req);
-  res.json({ user: publicUser(user) });
-}));
 
+const safeUser = publicUser(user);
+const token = createUserToken(safeUser.id);
+
+res.json({ user: safeUser, token });
+}));
 /* ------------------------------------------------------------- admin */
 app.post("/api/admin/login", ah(async (req, res) => {
   if (adminLoginLimiter.blocked(req)) {
@@ -506,7 +541,91 @@ function registerCrud(table, cfg) {
     res.json({ deleted: true });
   }));
 }
+// Residents can submit their own reports; they cannot choose another reporter.
+app.post("/api/issues/report", requireUser, ah(async (req, res) => {
+  const body = req.body || {};
+  const description =
+    typeof body.description === "string" ? body.description.trim() : "";
+  const categorySlug =
+    typeof body.category_slug === "string" ? body.category_slug.trim() : "";
 
+  if (!description || description.length > 5000) {
+    throw httpError(400, "Enter a description of up to 5000 characters.");
+  }
+
+  if (!categorySlug) {
+    throw httpError(400, "Choose an issue category.");
+  }
+
+  const validCoordinate = (v, min, max) =>
+    v === null || v === undefined ||
+    (typeof v === "number" && Number.isFinite(v) && v >= min && v <= max);
+
+  if (
+    !validCoordinate(body.latitude, -90, 90) ||
+    !validCoordinate(body.longitude, -180, 180)
+  ) {
+    throw httpError(400, "The location coordinates are invalid.");
+  }
+
+  const [categories] = await pool.query(
+    "SELECT id, department_id FROM categories WHERE slug = ? LIMIT 1",
+    [categorySlug]
+  );
+
+  if (!categories.length) {
+    throw httpError(400, "That category does not exist. Refresh and try again.");
+  }
+
+  const [priorities] = await pool.query(
+    "SELECT id FROM priorities WHERE label = 'Medium' LIMIT 1"
+  );
+  const [statuses] = await pool.query(
+    "SELECT id FROM statuses WHERE label = 'Pending' LIMIT 1"
+  );
+
+  if (!priorities.length || !statuses.length) {
+    throw httpError(500, "CIVIX is missing its default priority or status.");
+  }
+
+  const latitude = body.latitude ?? null;
+  const longitude = body.longitude ?? null;
+  const locationLabel =
+    latitude !== null && longitude !== null
+      ? `Lat ${latitude.toFixed(5)}, Lng ${longitude.toFixed(5)}`
+      : "Location not provided";
+
+  const [codes] = await pool.query(
+    "SELECT COALESCE(MAX(CAST(SUBSTRING(public_code, 4) AS UNSIGNED)), 1000) + 1 AS n FROM issues"
+  );
+  const publicCode = `CX-${codes[0].n}`;
+
+  const [result] = await pool.query(
+    `INSERT INTO issues
+      (public_code, reporter_id, category_id, description, location_label,
+       latitude, longitude, priority_id, status_id, department_id)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      publicCode,
+      req.userId,
+      categories[0].id,
+      description,
+      locationLabel,
+      latitude,
+      longitude,
+      priorities[0].id,
+      statuses[0].id,
+      categories[0].department_id ?? null,
+    ]
+  );
+
+  const [rows] = await pool.query(
+    "SELECT * FROM issues WHERE id = ?",
+    [result.insertId]
+  );
+
+  res.status(201).json(rows[0]);
+}));
 for (const [table, cfg] of Object.entries(TABLES)) registerCrud(table, cfg);
 
 app.get("/api", (req, res) => {
